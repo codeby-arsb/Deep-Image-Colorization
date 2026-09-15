@@ -200,3 +200,118 @@ python scripts/test_loss_training.py
   ```
   *(Checkpoints saved to `outputs/experiments/smooth_l1/checkpoints/` to ensure baseline protection)*
 
+## Self-Correcting Colorization
+
+This stage is an **iterative self-correction / refinement framework around the existing U-Net**. It does **not** retrain the U-Net and does **not** change U-Net weights. Feedback is applied in CIE Lab space to the predicted color image.
+
+### Original pipeline
+
+```text
+B&W
+ ↓
+U-Net
+ ↓
+Colorized Image
+```
+
+### New pipeline
+
+```text
+B&W
+ ↓
+U-Net  (once, frozen weights)
+ ↓
+AI Evaluation
+ ↓
+Feedback
+ ↓
+Lab Refinement
+ ↓
+Re-evaluation
+ ↓
+Repeat (until score ≥ threshold or max iterations)
+ ↓
+Best Result
+```
+
+The U-Net is run **once**. Later iterations refine the Lab prediction from the previous iteration. Returning the last iteration is not automatic: the highest-scoring refined iteration is kept; if no refinement is needed, the baseline is returned.
+
+### Evaluation metrics (0–100)
+
+| Metric | What it measures |
+| --- | --- |
+| Semantic | Per-class Lab statistics vs. reference stats, using DeepLabV3 masks |
+| Color realism | KL divergence of the a*/b* histogram vs. a reference histogram |
+| Boundary consistency | Color change across luminance / semantic edges |
+| Skin-tone consistency | Person-region Lab vs. a typical skin palette (`None` if no person) |
+| Saturation | Mean chroma; both under- and over-saturation are penalized |
+| Overall | Weighted combination of the available metrics |
+
+Default weights: semantic 0.25, realism 0.20, boundary 0.20, skin 0.15, saturation 0.20. If skin is not applicable, the remaining weights are renormalized.
+
+### Segmentation limitation (important)
+
+Semantic and skin metrics use `torchvision.models.segmentation.deeplabv3_resnet101` with **`DeepLabV3_ResNet101_Weights.DEFAULT`**. Those weights are Pascal VOC 21-class (`COCO_WITH_VOC_LABELS_V1`). Runtime class IDs are taken from `weights.meta["categories"]`.
+
+Available classes include `person` (VOC id 15) and objects such as `car` / `dog`, **not** ADE20K-style `sky`, `vegetation`, `water`, `road`, or `building`. The architecture can consume additional classes if they appear in both the weight metadata and `src/self_correct/semantic_ref_stats.json`. Those scene classes are **not fabricated**. With the default stats file, semantic evaluation is effectively **person-only**.
+
+If DeepLab weights cannot be downloaded, semantic and skin scores are skipped (`skin=None`, semantic=0) and the remaining metrics still run.
+
+### Feedback and Lab refinement
+
+`FeedbackGenerator` converts low metric scores into bounded Lab adjustments:
+
+* global a*/b* scale for saturation
+* per-class (a*, b*) shifts for valid semantic masks
+* skin (a*, b*) shift on the person mask only
+* edge-aware `cv2.bilateralFilter` strength for boundary issues (a*/b* only; L* unchanged)
+
+`refine()` copies the input, rejects NaN/inf, clips Lab to L* ∈ [0, 100] and a*/b* ∈ [-128, 128] (same convention as `src.utils.rgb_to_lab` / `lab_to_rgb`), and never mutates the original array.
+
+### Loop control and baseline comparison
+
+* Default `threshold = 85`, `max_iterations = 3`
+* Stop early when overall score ≥ threshold
+* Track `best_image`, `best_score`, `best_iteration` (iteration `0` = baseline)
+* Report baseline score, best self-corrected score, absolute improvement, and percentage improvement
+* Improvement **may be negative** if refinement does not help; that result is kept honestly
+
+### CLI
+
+```bash
+python -m src.self_correct.cli --input <image> --threshold 85 --max-iterations 3 --device auto
+```
+
+Optional: `--checkpoint path/to/best.pth`, `--output-dir ...`, `--no-segmentation` (skips DeepLab download).
+
+Prints:
+
+```text
+Self-Correcting Colorization
+
+Baseline Score: XX.XX
+
+Iteration 1: XX.XX
+Issues:
+  - ...
+
+Best Iteration: X
+Final Score: XX.XX
+Improvement: XX.XX
+```
+
+Writes `outputs/self_correction/<image_name>/`:
+
+* `baseline.png`, `iteration_*.png` (only iterations that ran), `final.png`
+* `evaluation.json`, `feedback.json`
+* `score_progression.png`, `comparison.png` (original B&W | baseline U-Net | final)
+
+### Tests
+
+```bash
+pytest -q tests/self_correct/
+pytest -q
+```
+
+Heavy pretrained segmentation weights are not required for the unit tests; the evaluator is constructed with `load_segmentation=False` and DeepLab is mocked by that flag.
+
