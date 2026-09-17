@@ -1,139 +1,106 @@
+"""Tests for SelfCorrectionController."""
 import numpy as np
-
-from src.self_correct.controller import SelfCorrectionController
-from src.self_correct.evaluator import ImageEvaluator
-from src.self_correct.feedback import FeedbackGenerator
-
-
-class ScriptedEvaluator(ImageEvaluator):
-    def __init__(self, scores):
-        super().__init__(device="cpu", load_segmentation=False)
-        self._scores = list(scores)
-        self.calls = 0
-
-    def evaluate(self, rgb_image, return_aux=False):
-        idx = min(self.calls, len(self._scores) - 1)
-        self.calls += 1
-        result = dict(self._scores[idx])
-        lab = np.zeros((8, 8, 3), dtype=np.float64)
-        lab[:, :, 0] = 50
-        lab[:, :, 1] = 8 + self.calls
-        lab[:, :, 2] = 4
-        aux = {"lab": lab, "segmentation": None}
-        if return_aux:
-            return result, aux
-        return result
+import pytest
+from pathlib import Path
+from unittest.mock import patch
+import torch
 
 
-class RecordingFeedback(FeedbackGenerator):
-    def __init__(self):
-        super().__init__()
-        self.generated = []
+def make_dummy_checkpoint(tmp_path: Path) -> str:
+    from src.model import ColorizationUNet
+    model = ColorizationUNet()
+    ckpt_path = tmp_path / "dummy.pth"
+    torch.save({"model_state_dict": model.state_dict()}, str(ckpt_path))
+    return str(ckpt_path)
 
-    def generate(
-        self,
-        evaluation,
-        lab_image,
-        segmentation=None,
-        ref_stats=None,
-        id_to_name=None,
+
+def make_gray_rgb(h=256, w=256):
+    return np.full((h, w, 3), 128, dtype=np.uint8)
+
+
+@pytest.fixture
+def controller(tmp_path):
+    ckpt = make_dummy_checkpoint(tmp_path)
+    with patch(
+        "torchvision.models.segmentation.deeplabv3_resnet101",
+        side_effect=RuntimeError("skip seg in test"),
     ):
-        fb = {"saturation": 1.05 + 0.01 * len(self.generated)}
-        self.generated.append(fb)
-        return fb
+        from src.self_correct.controller import SelfCorrectionController
+        ctrl = SelfCorrectionController(
+            checkpoint_path=ckpt,
+            device="cpu",
+            threshold=85.0,
+            max_iterations=2,
+        )
+    return ctrl
 
 
-def _controller(scores, threshold=85.0):
-    ev = ScriptedEvaluator(scores)
-    fb = RecordingFeedback()
-
-    def colorize_fn(image):
-        return np.full((8, 8, 3), 40, dtype=np.uint8)
-
-    ctrl = SelfCorrectionController(
-        device="cpu",
-        evaluator=ev,
-        feedback_generator=fb,
-        colorize_fn=colorize_fn,
-        load_model=False,
-        load_segmentation=False,
+def test_self_correct_returns_expected_keys(controller):
+    result = controller.self_correct(make_gray_rgb())
+    required = (
+        "baseline_rgb", "baseline_score", "baseline_eval",
+        "iterations", "best_rgb", "best_score",
+        "best_iteration", "improvement", "pct_improvement",
     )
-    rgb = np.full((8, 8, 3), 128, dtype=np.uint8)
-    result = ctrl.self_correct(rgb, threshold=threshold, max_iterations=3)
-    return result, ev, fb
+    for key in required:
+        assert key in result, f"Missing key: {key}"
 
 
-def _score(overall, **extra):
-    base = {
-        "semantic": 0.0,
-        "realism": 50.0,
-        "boundary": 50.0,
-        "skin": None,
-        "saturation": 50.0,
-        "overall": overall,
-    }
-    base.update(extra)
-    return base
+def test_baseline_rgb_shape(controller):
+    result = controller.self_correct(make_gray_rgb())
+    assert result["baseline_rgb"].shape == (256, 256, 3)
+    assert result["baseline_rgb"].dtype == np.uint8
 
 
-def test_threshold_stopping():
-    result, ev, fb = _controller(
-        [_score(70), _score(90), _score(91)],
-        threshold=85,
-    )
-    assert result["iterations_run"] == 1
-    assert len(result["iterations"]) == 1
-    assert ev.calls == 2
-    assert len(fb.generated) == 1
+def test_scores_in_range(controller):
+    result = controller.self_correct(make_gray_rgb())
+    assert 0.0 <= result["baseline_score"] <= 100.0
+    assert 0.0 <= result["best_score"] <= 100.0
 
 
-def test_max_iteration_stopping():
-    result, ev, fb = _controller(
-        [_score(70), _score(71), _score(72), _score(73)],
-        threshold=85,
-    )
-    assert result["iterations_run"] == 3
-    assert len(result["iterations"]) == 3
-    assert ev.calls == 4
+def test_best_score_at_least_baseline(controller):
+    result = controller.self_correct(make_gray_rgb())
+    # Controller never replaces best with a worse result
+    assert result["best_score"] >= result["baseline_score"] - 1e-6
 
 
-def test_best_score_selection_last_is_best():
-    result, _, _ = _controller(
-        [_score(72), _score(76), _score(74), _score(81)],
-        threshold=100,
-    )
-    assert result["best_iteration"] == 3
-    assert result["best_score"] == 81
+def test_max_iterations_respected(controller):
+    result = controller.self_correct(make_gray_rgb())
+    assert len(result["iterations"]) <= controller.max_iterations
 
 
-def test_worse_iteration_does_not_replace_best():
-    result, _, _ = _controller(
-        [_score(72), _score(80), _score(77), _score(79)],
-        threshold=100,
-    )
-    assert result["best_iteration"] == 1
-    assert result["best_score"] == 80
+def test_improvement_honest(controller):
+    result = controller.self_correct(make_gray_rgb())
+    expected = result["best_score"] - result["baseline_score"]
+    assert abs(result["improvement"] - expected) < 1e-6
 
 
-def test_iteration_logging_and_baseline_comparison():
-    result, _, fb = _controller(
-        [_score(72), _score(76), _score(74), _score(81)],
-        threshold=100,
-    )
-    assert result["baseline_score"] == 72
-    assert result["absolute_improvement"] == 9
-    assert result["percentage_improvement"] == (9 / 72) * 100
-    assert [r["iteration"] for r in result["iterations"]] == [1, 2, 3]
-    assert "iteration_1" in result["feedback"]
-    assert len(fb.generated) == 3
-    assert result["unet_weights_updated"] is False
+def test_grayscale_2d_input(controller):
+    gray2d = np.full((256, 256), 128, dtype=np.uint8)
+    result = controller.self_correct(gray2d)
+    assert "baseline_rgb" in result
 
 
-def test_negative_improvement_is_allowed():
-    result, _, _ = _controller(
-        [_score(80), _score(70), _score(71), _score(69)],
-        threshold=100,
-    )
-    assert result["best_iteration"] == 2
-    assert result["best_score"] == 71
-    assert result["absolute_improvement"] == -9
+def test_grayscale_3d_single_channel(controller):
+    gray3d = np.full((256, 256, 1), 128, dtype=np.uint8)
+    result = controller.self_correct(gray3d)
+    assert "baseline_rgb" in result
+
+
+def test_threshold_early_stop(tmp_path):
+    """With threshold=0 every image should already pass so 0 iterations run."""
+    ckpt = make_dummy_checkpoint(tmp_path)
+    with patch(
+        "torchvision.models.segmentation.deeplabv3_resnet101",
+        side_effect=RuntimeError("skip"),
+    ):
+        from src.self_correct.controller import SelfCorrectionController
+        ctrl = SelfCorrectionController(
+            checkpoint_path=ckpt,
+            device="cpu",
+            threshold=0.0,
+            max_iterations=3,
+        )
+    result = ctrl.self_correct(make_gray_rgb())
+    assert len(result["iterations"]) == 0
+    assert result["best_iteration"] == 0

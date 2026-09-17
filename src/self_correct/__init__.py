@@ -1,10 +1,10 @@
-"""self_correct package for iterative colorization improvement.
+"""self_correct: iterative self-correcting colorization wrapper.
 
-This package does NOT modify the existing U-Net model; it wraps it with an
-evaluation-feedback-Lab-refinement loop. U-Net weights are never updated.
+This package wraps the existing ColorizationUNet with an iterative
+evaluate -> feedback -> refine loop. It never modifies or retrains the
+U-Net; all corrections are applied in CIE Lab colour space post-inference.
 """
-
-from .evaluator import ImageEvaluator, map_evaluable_classes
+from .evaluator import ImageEvaluator
 from .feedback import FeedbackGenerator
 from .refinement import refine
 from .controller import SelfCorrectionController
@@ -12,7 +12,6 @@ from .controller import SelfCorrectionController
 __all__ = [
     "ImageEvaluator",
     "FeedbackGenerator",
-    "SelfCorrectionController",
     "refine",
-    "map_evaluable_classes",
+    "SelfCorrectionController",
 ]

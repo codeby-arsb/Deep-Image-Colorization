@@ -192,6 +192,8 @@ class ImageEvaluator:
             )
             self.seg_available = False
             self.seg_model = None
+            self.id_to_name = {}
+            self.person_class_id = None
 
     def segment(self, rgb_image: np.ndarray) -> Optional[torch.Tensor]:
         """Return a (H, W) class-id map, or None if segmentation is unavailable."""

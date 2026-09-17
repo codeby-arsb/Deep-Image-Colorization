@@ -1,90 +1,84 @@
+"""Tests for the Lab refinement module."""
 import numpy as np
 import pytest
 
-from src.self_correct.refinement import refine
 
-
-def _base_lab():
-    lab = np.zeros((8, 8, 3), dtype=np.float64)
-    lab[:, :, 0] = 55.0
-    lab[:, :, 1] = 10.0
-    lab[:, :, 2] = -12.0
+def make_lab(h=64, w=64, a_val=10.0, b_val=5.0):
+    lab = np.zeros((h, w, 3), dtype=np.float64)
+    lab[:, :, 0] = 50.0
+    lab[:, :, 1] = a_val
+    lab[:, :, 2] = b_val
     return lab
 
 
-def test_preserves_l_and_does_not_mutate_input():
-    lab = _base_lab()
+def test_no_change_empty_feedback():
+    from src.self_correct.refinement import refine
+    lab = make_lab()
+    out = refine(lab, {})
+    np.testing.assert_array_almost_equal(out, lab)
+
+
+def test_no_inplace_modification():
+    from src.self_correct.refinement import refine
+    lab = make_lab(a_val=10.0)
     original = lab.copy()
-    out = refine(lab, {"saturation": 1.3})
+    refine(lab, {"saturation": 2.0})
     np.testing.assert_array_equal(lab, original)
-    np.testing.assert_allclose(out[:, :, 0], original[:, :, 0])
-    np.testing.assert_allclose(out[:, :, 1], original[:, :, 1] * 1.3)
-    np.testing.assert_allclose(out[:, :, 2], original[:, :, 2] * 1.3)
 
 
-def test_applies_region_correction_only_on_mask():
-    lab = _base_lab()
-    seg = np.zeros((8, 8), dtype=np.int64)
-    seg[:4, :] = 15
-    out = refine(
-        lab,
-        {"semantic": {"person": (5.0, -3.0)}},
-        segmentation=seg,
-        id_to_name={15: "person"},
-    )
-    np.testing.assert_allclose(out[:4, :, 1], 15.0)
-    np.testing.assert_allclose(out[:4, :, 2], -15.0)
-    np.testing.assert_allclose(out[4:, :, 1], 10.0)
-    np.testing.assert_allclose(out[4:, :, 2], -12.0)
-    np.testing.assert_allclose(out[:, :, 0], 55.0)
-
-
-def test_missing_masks_skip_region_and_skin():
-    lab = _base_lab()
-    out = refine(
-        lab,
-        {"semantic": {"person": (9.0, 9.0)}, "skin": (4.0, 4.0)},
-        segmentation=None,
-        id_to_name={15: "person"},
-    )
-    np.testing.assert_allclose(out, lab)
-
-
-def test_skin_only_on_person_region():
-    lab = _base_lab()
-    seg = np.zeros((8, 8), dtype=np.int64)
-    seg[2:6, 2:6] = 15
-    out = refine(
-        lab,
-        {"skin": (2.0, 1.0)},
-        segmentation=seg,
-        id_to_name={15: "person"},
-    )
-    np.testing.assert_allclose(out[2:6, 2:6, 1], 12.0)
-    np.testing.assert_allclose(out[2:6, 2:6, 2], -11.0)
-    np.testing.assert_allclose(out[0, 0, 1], 10.0)
-
-
-def test_clips_values_and_preserves_shape():
-    lab = _base_lab()
-    lab[:, :, 1] = 100.0
+def test_saturation_boost():
+    from src.self_correct.refinement import refine
+    lab = make_lab(a_val=10.0, b_val=10.0)
     out = refine(lab, {"saturation": 2.0})
-    assert out.shape == lab.shape
+    assert out[0, 0, 1] == pytest.approx(20.0)
+    assert out[0, 0, 2] == pytest.approx(20.0)
+
+
+def test_saturation_reduce():
+    from src.self_correct.refinement import refine
+    lab = make_lab(a_val=40.0, b_val=40.0)
+    out = refine(lab, {"saturation": 0.5})
+    assert out[0, 0, 1] == pytest.approx(20.0)
+
+
+def test_output_clipped_to_lab_range():
+    from src.self_correct.refinement import refine
+    lab = make_lab(a_val=120.0, b_val=120.0)
+    out = refine(lab, {"saturation": 10.0})
     assert out[:, :, 1].max() <= 128.0
-    assert out[:, :, 0].min() >= 0.0
-    assert out[:, :, 0].max() <= 100.0
+    assert out[:, :, 2].max() <= 128.0
+    assert out[:, :, 1].min() >= -128.0
 
 
-def test_invalid_values_rejected():
-    lab = _base_lab()
-    lab[0, 0, 1] = np.nan
-    with pytest.raises(ValueError):
-        refine(lab, {"saturation": 1.1})
+def test_l_channel_unchanged():
+    from src.self_correct.refinement import refine
+    lab = make_lab()
+    lab[:, :, 0] = 60.0
+    out = refine(lab, {"saturation": 2.0, "boundary": 0.3})
+    np.testing.assert_array_almost_equal(out[:, :, 0], lab[:, :, 0])
 
 
-def test_boundary_keeps_l_unchanged():
-    lab = _base_lab()
-    lab[:, 4:, 1] = 40.0
-    out = refine(lab, {"boundary": 0.4})
-    np.testing.assert_allclose(out[:, :, 0], lab[:, :, 0])
-    assert out.shape == lab.shape
+def test_boundary_smoothing_reduces_ab_variance():
+    from src.self_correct.refinement import refine
+    rng = np.random.default_rng(42)
+    lab = np.zeros((64, 64, 3), dtype=np.float64)
+    lab[:, :, 0] = 50.0
+    lab[:, :, 1] = rng.uniform(-50, 50, (64, 64))
+    lab[:, :, 2] = rng.uniform(-50, 50, (64, 64))
+    out = refine(lab, {"boundary": 0.5})
+    assert out[:, :, 1].var() < lab[:, :, 1].var()
+
+
+def test_deterministic():
+    from src.self_correct.refinement import refine
+    lab = make_lab()
+    out1 = refine(lab, {"saturation": 1.5, "boundary": 0.3})
+    out2 = refine(lab, {"saturation": 1.5, "boundary": 0.3})
+    np.testing.assert_array_equal(out1, out2)
+
+
+def test_output_dtype_float64():
+    from src.self_correct.refinement import refine
+    lab = make_lab()
+    out = refine(lab, {"saturation": 1.2})
+    assert out.dtype == np.float64

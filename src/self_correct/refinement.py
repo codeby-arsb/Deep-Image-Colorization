@@ -1,106 +1,135 @@
-from typing import Any, Dict, Optional
+"""Lab-space image refinement for the self-correcting colorization pipeline.
+
+All operations work in CIE Lab colour space and produce a new array;
+the input is never modified in place. Refinement is deterministic.
+"""
+from __future__ import annotations
 
 import cv2
 import numpy as np
+from typing import Any, Dict, Optional, Tuple
 
-from .feedback import as_seg_np
 
-L_MIN, L_MAX = 0.0, 100.0
-AB_MIN, AB_MAX = -128.0, 128.0
+# Valid Lab ranges: L*: [0,100], a*: [-128,128], b*: [-128,128]
+_LAB_RANGES: Dict[int, Tuple[float, float]] = {
+    0: (0.0, 100.0),
+    1: (-128.0, 128.0),
+    2: (-128.0, 128.0),
+}
 
 
 def _clip_lab(lab: np.ndarray) -> np.ndarray:
-    out = lab.copy()
-    out[:, :, 0] = np.clip(out[:, :, 0], L_MIN, L_MAX)
-    out[:, :, 1] = np.clip(out[:, :, 1], AB_MIN, AB_MAX)
-    out[:, :, 2] = np.clip(out[:, :, 2], AB_MIN, AB_MAX)
-    return out
+    """Clip each channel to its valid Lab range."""
+    result = lab.copy()
+    for ch, (lo, hi) in _LAB_RANGES.items():
+        result[:, :, ch] = np.clip(result[:, :, ch], lo, hi)
+    return result
 
 
-def _name_to_ids(id_to_name: Optional[Dict[int, str]]) -> Dict[str, int]:
-    if not id_to_name:
-        return {}
-    return {name: cid for cid, name in id_to_name.items()}
+def _edge_aware_smooth_ab(
+    lab: np.ndarray,
+    strength: float,
+    d: int = 9,
+    sigma_color: float = 75.0,
+    sigma_space: float = 75.0,
+) -> np.ndarray:
+    """Apply bilateral filtering to the a*/b* channels.
+
+    Linearly blends between original and smoothed by strength in [0, 1].
+    The L* channel is left unchanged. The bilateral filter respects luminance
+    edges so colour bleed across high-contrast boundaries is reduced.
+    """
+    if strength <= 0.0:
+        return lab.copy()
+    strength = min(1.0, float(strength))
+
+    # Bilateral filter requires uint8 input.
+    # Map a* and b* from [-128, 128] to [0, 255].
+    a_u8 = np.clip((lab[:, :, 1] + 128.0) / 256.0 * 255.0, 0, 255).astype(np.uint8)
+    b_u8 = np.clip((lab[:, :, 2] + 128.0) / 256.0 * 255.0, 0, 255).astype(np.uint8)
+
+    a_smooth = cv2.bilateralFilter(a_u8, d, sigma_color, sigma_space)
+    b_smooth = cv2.bilateralFilter(b_u8, d, sigma_color, sigma_space)
+
+    # Map back to float Lab range.
+    a_f = a_smooth.astype(np.float64) / 255.0 * 256.0 - 128.0
+    b_f = b_smooth.astype(np.float64) / 255.0 * 256.0 - 128.0
+
+    result = lab.copy()
+    result[:, :, 1] = (1.0 - strength) * lab[:, :, 1] + strength * a_f
+    result[:, :, 2] = (1.0 - strength) * lab[:, :, 2] + strength * b_f
+    return result
 
 
 def refine(
     lab_image: np.ndarray,
-    feedback: Optional[Dict[str, Any]] = None,
-    segmentation=None,
+    feedback: Dict[str, Any],
+    segmentation: Optional[Any] = None,
     id_to_name: Optional[Dict[int, str]] = None,
 ) -> np.ndarray:
-    """Deterministic CIE Lab refinement. Never mutates ``lab_image``.
+    """Apply feedback corrections to a Lab image and return a new array.
 
-    Uses the same Lab convention as ``src.utils.rgb_to_lab`` / ``lab_to_rgb``
-    (skimage CIE Lab: L* in [0, 100], a*/b* typically in [-128, 128]).
-    L* is not modified except for safety clipping of invalid values.
+    Parameters
+    ----------
+    lab_image:
+        H x W x 3 Lab image in float64. Not modified in place.
+    feedback:
+        Dict produced by FeedbackGenerator.generate. Recognised keys:
+
+        - ``"saturation"``: float scale factor applied to global chroma (a*, b*)
+        - ``"semantic"``: ``Dict[str, Tuple[float, float]]`` per-class (da, db) shifts
+        - ``"skin"``: ``Tuple[float, float]`` (da, db) for the person region
+        - ``"boundary"``: float smoothing strength in [0, 0.5]
+
+    segmentation:
+        Optional segmentation tensor (shape [1, H, W], dtype long) from the evaluator.
+    id_to_name:
+        Mapping ``class_id -> class_name`` from the evaluator.
+
+    Returns
+    -------
+    np.ndarray
+        Refined Lab image clipped to valid Lab ranges. New array, input unchanged.
     """
-    if lab_image is None:
-        raise ValueError("lab_image is required")
-    lab = np.array(lab_image, dtype=np.float64, copy=True)
-    if lab.ndim != 3 or lab.shape[2] != 3:
-        raise ValueError(f"lab_image must have shape (H, W, 3), got {lab.shape}")
-    if not np.isfinite(lab).all():
-        raise ValueError("lab_image contains NaN or inf")
+    result = lab_image.astype(np.float64)
 
-    original_l = lab[:, :, 0].copy()
-    feedback = feedback or {}
-    seg_np = as_seg_np(segmentation)
-    if seg_np is not None and seg_np.shape[:2] != lab.shape[:2]:
-        seg_np = cv2.resize(
-            seg_np,
-            (lab.shape[1], lab.shape[0]),
-            interpolation=cv2.INTER_NEAREST,
-        )
-    name_to_id = _name_to_ids(id_to_name)
+    # 1. Global saturation adjustment (scale a* and b* uniformly)
+    if "saturation" in feedback:
+        factor = float(feedback["saturation"])
+        result[:, :, 1] *= factor
+        result[:, :, 2] *= factor
 
-    sat = feedback.get("saturation")
-    if sat is not None:
-        factor = float(sat)
-        if not np.isfinite(factor):
-            raise ValueError("saturation factor is not finite")
-        lab[:, :, 1] *= factor
-        lab[:, :, 2] *= factor
-
-    semantic = feedback.get("semantic") or {}
-    if semantic and seg_np is not None:
-        for name, delta in semantic.items():
-            cid = name_to_id.get(name)
-            if cid is None:
+    # 2. Per-class semantic ab shifts
+    if "semantic" in feedback and segmentation is not None and id_to_name is not None:
+        seg_np = segmentation.squeeze(0).cpu().numpy().astype(np.int64)
+        per_class: Dict[str, Tuple[float, float]] = feedback["semantic"]
+        for class_id, name in id_to_name.items():
+            if name not in per_class:
                 continue
-            mask = seg_np == cid
+            mask = seg_np == class_id
             if not mask.any():
                 continue
-            da, db = float(delta[0]), float(delta[1])
-            if not (np.isfinite(da) and np.isfinite(db)):
-                continue
-            lab[:, :, 1][mask] += da
-            lab[:, :, 2][mask] += db
+            da, db = per_class[name]
+            result[:, :, 1][mask] += da
+            result[:, :, 2][mask] += db
 
-    skin = feedback.get("skin")
-    if skin is not None and seg_np is not None:
-        cid = name_to_id.get("person")
-        if cid is not None:
-            mask = seg_np == cid
-            if mask.any():
-                da, db = float(skin[0]), float(skin[1])
-                if np.isfinite(da) and np.isfinite(db):
-                    lab[:, :, 1][mask] += da
-                    lab[:, :, 2][mask] += db
+    # 3. Skin-tone correction (person region only)
+    if "skin" in feedback and segmentation is not None and id_to_name is not None:
+        da, db = feedback["skin"]
+        seg_np = segmentation.squeeze(0).cpu().numpy().astype(np.int64)
+        person_ids = [cid for cid, name in id_to_name.items() if name == "person"]
+        if not person_ids:
+            person_ids = [15]  # Confirmed Pascal VOC ID for person.
+        person_mask = np.isin(seg_np, person_ids)
+        if person_mask.any():
+            result[:, :, 1][person_mask] += da
+            result[:, :, 2][person_mask] += db
 
-    boundary = feedback.get("boundary")
-    if boundary is not None:
-        strength = float(np.clip(boundary, 0.0, 1.0))
-        if strength > 0:
-            a = lab[:, :, 1].astype(np.float32)
-            b = lab[:, :, 2].astype(np.float32)
-            filtered_a = cv2.bilateralFilter(a, d=5, sigmaColor=25.0, sigmaSpace=5)
-            filtered_b = cv2.bilateralFilter(b, d=5, sigmaColor=25.0, sigmaSpace=5)
-            lab[:, :, 1] = (1.0 - strength) * a + strength * filtered_a
-            lab[:, :, 2] = (1.0 - strength) * b + strength * filtered_b
+    # 4. Edge-aware boundary smoothing
+    if "boundary" in feedback:
+        strength = float(feedback["boundary"])
+        result = _edge_aware_smooth_ab(result, strength)
 
-    lab[:, :, 0] = original_l
-    lab = _clip_lab(lab)
-    if lab.shape != tuple(lab_image.shape):
-        raise RuntimeError("refinement changed image dimensions")
-    return lab
+    # 5. Clip to valid Lab ranges
+    result = _clip_lab(result)
+    return result

@@ -1,100 +1,86 @@
+"""Tests for the CLI module."""
 import json
-
-import cv2
 import numpy as np
+import pytest
+from pathlib import Path
+from unittest.mock import patch
+import torch
 
-from src.self_correct import cli
-from src.self_correct.controller import SelfCorrectionController
+
+def make_dummy_checkpoint(tmp_path: Path) -> str:
+    from src.model import ColorizationUNet
+    model = ColorizationUNet()
+    ckpt_path = tmp_path / "dummy.pth"
+    torch.save({"model_state_dict": model.state_dict()}, str(ckpt_path))
+    return str(ckpt_path)
 
 
-def test_cli_smoke(tmp_path, monkeypatch):
-    image_path = tmp_path / "sample.png"
-    rgb = np.zeros((32, 32, 3), dtype=np.uint8)
-    rgb[:, :] = [80, 80, 80]
-    cv2.imwrite(str(image_path), cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
-    out_dir = tmp_path / "out"
+@pytest.fixture
+def cli_env(tmp_path):
+    from PIL import Image
+    img = Image.fromarray(np.full((64, 64, 3), 128, dtype=np.uint8))
+    img_path = tmp_path / "test_input.png"
+    img.save(str(img_path))
+    ckpt = make_dummy_checkpoint(tmp_path)
+    return {"img_path": str(img_path), "ckpt": ckpt, "tmp_path": tmp_path}
 
-    class FakeController(SelfCorrectionController):
-        def __init__(self, *args, **kwargs):
-            dummy = np.full((32, 32, 3), 90, dtype=np.uint8)
-            super().__init__(
-                device="cpu",
-                colorize_fn=lambda img: dummy,
-                load_model=False,
-                load_segmentation=False,
-            )
 
-        def self_correct(
-            self,
-            rgb_image,
+def _run_cli(cli_env, tmp_path, monkeypatch, max_iterations=1):
+    monkeypatch.chdir(tmp_path)
+    with patch(
+        "torchvision.models.segmentation.deeplabv3_resnet101",
+        side_effect=RuntimeError("skip seg in test"),
+    ):
+        from src.self_correct import cli
+        import argparse
+        args = argparse.Namespace(
+            input=cli_env["img_path"],
             threshold=85.0,
-            max_iterations=3,
-            output_dir=None,
-            image_name=None,
-        ):
-            result = {
-                "baseline": {
-                    "semantic": 0.0,
-                    "realism": 40.0,
-                    "boundary": 50.0,
-                    "skin": None,
-                    "saturation": 45.0,
-                    "overall": 44.0,
-                },
-                "iterations": [
-                    {
-                        "iteration": 1,
-                        "semantic": 0.0,
-                        "realism": 42.0,
-                        "boundary": 52.0,
-                        "skin": None,
-                        "saturation": 48.0,
-                        "overall": 46.0,
-                    }
-                ],
-                "best_iteration": 1,
-                "best_score": 46.0,
-                "absolute_improvement": 2.0,
-                "percentage_improvement": (2.0 / 44.0) * 100,
-                "feedback": {"iteration_1": {"saturation": 1.1}},
-                "baseline_rgb": np.full((32, 32, 3), 70, dtype=np.uint8),
-                "best_rgb": np.full((32, 32, 3), 90, dtype=np.uint8),
-                "gray_rgb": np.full((32, 32, 3), 80, dtype=np.uint8),
-                "iteration_images": [np.full((32, 32, 3), 90, dtype=np.uint8)],
-                "checkpoint_loaded": False,
-                "checkpoint_path": None,
-                "unet_weights_updated": False,
-                "iterations_run": 1,
-            }
-            if output_dir:
-                SelfCorrectionController._write_outputs(self, output_dir, result)
-            return result
+            max_iterations=max_iterations,
+            device="cpu",
+            checkpoint=cli_env["ckpt"],
+        )
+        cli.run(args)
+    return tmp_path / "outputs" / "self_correction" / "test_input"
 
-    monkeypatch.setattr(cli, "SelfCorrectionController", FakeController)
-    code = cli.main(
-        [
-            "--input",
-            str(image_path),
-            "--threshold",
-            "85",
-            "--max-iterations",
-            "3",
-            "--device",
-            "cpu",
-            "--output-dir",
-            str(out_dir),
-            "--no-segmentation",
-        ]
-    )
-    assert code == 0
-    assert (out_dir / "baseline.png").is_file()
-    assert (out_dir / "iteration_1.png").is_file()
-    assert not (out_dir / "iteration_2.png").is_file()
-    assert (out_dir / "final.png").is_file()
-    assert (out_dir / "evaluation.json").is_file()
-    assert (out_dir / "feedback.json").is_file()
-    assert (out_dir / "score_progression.png").is_file()
-    assert (out_dir / "comparison.png").is_file()
-    payload = json.loads((out_dir / "evaluation.json").read_text(encoding="utf-8"))
-    assert payload["best_iteration"] == 1
-    assert payload["baseline"]["overall"] == 44.0
+
+def test_cli_produces_baseline(cli_env, tmp_path, monkeypatch):
+    out_dir = _run_cli(cli_env, tmp_path, monkeypatch)
+    assert (out_dir / "baseline.png").exists()
+
+
+def test_cli_produces_final(cli_env, tmp_path, monkeypatch):
+    out_dir = _run_cli(cli_env, tmp_path, monkeypatch)
+    assert (out_dir / "final.png").exists()
+
+
+def test_cli_produces_evaluation_json(cli_env, tmp_path, monkeypatch):
+    out_dir = _run_cli(cli_env, tmp_path, monkeypatch)
+    assert (out_dir / "evaluation.json").exists()
+
+
+def test_evaluation_json_valid(cli_env, tmp_path, monkeypatch):
+    out_dir = _run_cli(cli_env, tmp_path, monkeypatch)
+    with open(out_dir / "evaluation.json") as f:
+        data = json.load(f)
+    assert "baseline" in data
+    assert "overall" in data["baseline"]
+    # All score values should be 0-100
+    for k, v in data["baseline"].items():
+        if v is not None:
+            assert 0.0 <= v <= 100.0, f"Score {k}={v} out of range"
+
+
+def test_cli_produces_score_progression(cli_env, tmp_path, monkeypatch):
+    out_dir = _run_cli(cli_env, tmp_path, monkeypatch)
+    assert (out_dir / "score_progression.png").exists()
+
+
+def test_cli_produces_comparison(cli_env, tmp_path, monkeypatch):
+    out_dir = _run_cli(cli_env, tmp_path, monkeypatch)
+    assert (out_dir / "comparison.png").exists()
+
+
+def test_cli_produces_feedback_json(cli_env, tmp_path, monkeypatch):
+    out_dir = _run_cli(cli_env, tmp_path, monkeypatch)
+    assert (out_dir / "feedback.json").exists()

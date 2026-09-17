@@ -223,7 +223,12 @@ class ColorizationInferenceService:
             pred_ab_256 = out_ab.squeeze(0).cpu().numpy().astype(np.float32) / 110.0 # roughly [-1, 1]
 
             # Reconstruct high-resolution RGB
-            out_rgb_float = colorizer_util.postprocess_tens(tens_l_orig, out_ab)
+            # ``postprocess_tens`` concatenates the original L* tensor with the
+            # predicted a*/b* tensor. Keep both on the model device (CUDA when
+            # available) before it performs that operation.
+            out_rgb_float = colorizer_util.postprocess_tens(
+                tens_l_orig.to(self.device), out_ab
+            )
 
             # Apply user tuning if requested
             if saturation != 1.0 or tint != 0.0 or warmth != 0.0 or denoise > 0:
