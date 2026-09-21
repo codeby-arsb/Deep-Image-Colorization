@@ -3,6 +3,7 @@ import sys
 import time
 import argparse
 import csv
+import math
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -19,17 +20,19 @@ from model import ColorizationUNet
 from dataset import create_dataloader
 from device import get_device, get_device_name, get_amp_device_type, get_memory_stats
 from evaluate import evaluate_fixed_test_images
-from losses import get_loss_function, get_loss_metadata, DEFAULT_SMOOTH_L1_BETA
+from losses import get_loss_function, get_loss_metadata, DEFAULT_SMOOTH_L1_BETA, DEFAULT_CHROMA_ALPHA
 
 def get_args():
     parser = argparse.ArgumentParser(description="Train Colorization U-Net")
     parser.add_argument("--epochs", type=int, default=20, help="Number of epochs to train")
     parser.add_argument("--batch-size", type=int, default=8, help="Batch size")
     parser.add_argument("--lr", type=float, default=2e-4, help="Learning rate")
-    parser.add_argument("--loss", type=str, default="mse", choices=["mse", "smooth_l1"],
-                        help="Loss function: 'mse' (Baseline) or 'smooth_l1' (Huber)")
+    parser.add_argument("--loss", type=str, default="mse", choices=["mse", "smooth_l1", "chroma_weighted_mse"],
+                        help="Loss function: 'mse' (Baseline), 'smooth_l1' (Huber), or 'chroma_weighted_mse'")
     parser.add_argument("--loss-beta", type=float, default=DEFAULT_SMOOTH_L1_BETA,
                         help="Beta threshold parameter for Smooth L1 loss (default: 1.0)")
+    parser.add_argument("--loss-alpha", type=float, default=DEFAULT_CHROMA_ALPHA,
+                        help="Alpha factor for Chroma-Weighted MSE loss (default: 1.0)")
     parser.add_argument("--exp-dir", type=str, default=None,
                         help="Custom experiment output directory for checkpoints and metrics")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
@@ -58,8 +61,8 @@ def main():
     use_amp = args.amp and (amp_type is not None)
     
     # Loss, Optimizer, Scheduler
-    criterion = get_loss_function(args.loss, beta=args.loss_beta)
-    loss_meta = get_loss_metadata(args.loss, beta=args.loss_beta)
+    criterion = get_loss_function(args.loss, beta=args.loss_beta, alpha=args.loss_alpha)
+    loss_meta = get_loss_metadata(args.loss, beta=args.loss_beta, alpha=args.loss_alpha)
     
     # Output paths with strict baseline protection
     if args.exp_dir:
@@ -68,8 +71,15 @@ def main():
         plots_dir = os.path.join(exp_dir, "plots")
         history_file = os.path.join(exp_dir, "training_history.csv")
         eval_dir = os.path.join(exp_dir, "evaluation")
-    elif args.loss != "mse":
+    elif args.loss == "smooth_l1":
         exp_sub = "smoke_test_smooth_l1" if args.smoke_test else os.path.join("experiments", "smooth_l1")
+        exp_dir = os.path.join(project_root, "outputs", exp_sub)
+        checkpoints_dir = os.path.join(exp_dir, "checkpoints")
+        plots_dir = os.path.join(exp_dir, "plots")
+        history_file = os.path.join(exp_dir, "training_history.csv")
+        eval_dir = os.path.join(exp_dir, "evaluation")
+    elif args.loss == "chroma_weighted_mse":
+        exp_sub = "smoke_test_chroma_weighted" if args.smoke_test else os.path.join("experiments", "chroma_weighted")
         exp_dir = os.path.join(project_root, "outputs", exp_sub)
         checkpoints_dir = os.path.join(exp_dir, "checkpoints")
         plots_dir = os.path.join(exp_dir, "plots")
@@ -92,7 +102,14 @@ def main():
     train_loader = create_dataloader(train_manifest, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
     val_loader = create_dataloader(val_manifest, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
 
-    exp_name = "Baseline (MSE)" if args.loss == "mse" else "Experiment 2 — Smooth L1"
+    if args.loss == "mse":
+        exp_name = "Baseline (MSE)"
+    elif args.loss == "smooth_l1":
+        exp_name = "Experiment 2 — Smooth L1"
+    elif args.loss == "chroma_weighted_mse":
+        exp_name = "Experiment 3 — Chroma-Weighted MSE"
+    else:
+        exp_name = f"Experiment — {args.loss}"
     output_dir = exp_dir if 'exp_dir' in locals() else os.path.dirname(checkpoints_dir)
 
     print("==================================================")
@@ -286,6 +303,7 @@ def main():
             'loss_name': args.loss,
             'loss_config': loss_meta,
             'loss_beta': args.loss_beta if args.loss == 'smooth_l1' else None,
+            'loss_alpha': args.loss_alpha if args.loss == 'chroma_weighted_mse' else None,
             'config': vars(args)
         }
         
@@ -318,8 +336,8 @@ def main():
         print("\n==================================================")
         print("SMOKE TEST VALIDATION")
         print("==================================================")
-        print(f"Loss Finite: PASS (Final Loss: {train_loss:.4f})")
-        print(f"Backward Pass: PASS")
+        print(f"Loss Finite: {'PASS' if not math.isnan(train_loss) and not math.isinf(train_loss) else 'FAIL'} (Final Loss: {train_loss:.4f})")
+        print("Backward Pass: PASS")
         print(f"Parameter Update Test: {'PASS' if param_updated else 'FAIL'}")
         
         # Integrity Test
@@ -349,7 +367,12 @@ def main():
             print("\nCUDA Memory Metrics: Not applicable on this Mac")
     else:
         # Full training post-verification
-        exp_name = "SMOOTH L1" if args.loss == "smooth_l1" else "BASELINE"
+        if args.loss == "smooth_l1":
+            exp_name = "SMOOTH L1"
+        elif args.loss == "chroma_weighted_mse":
+            exp_name = "CHROMA-WEIGHTED MSE"
+        else:
+            exp_name = "BASELINE"
         print("\n==================================================")
         print(f"POST-TRAINING {exp_name} VERIFICATION & EVALUATION")
         print("==================================================")
@@ -400,10 +423,17 @@ def main():
         plt.plot(epochs_range, history['train_loss'], label='Train Loss', marker='o')
         plt.plot(epochs_range, history['val_loss'], label='Validation Loss', marker='x')
         plt.xlabel('Epoch')
-        loss_ylabel = "Smooth L1 Loss" if args.loss == "smooth_l1" else "MSE Loss"
+        if args.loss == "smooth_l1":
+            loss_ylabel = "Smooth L1 Loss"
+            plot_title = "Smooth L1 Experiment — Training & Validation Loss"
+        elif args.loss == "chroma_weighted_mse":
+            loss_ylabel = "Chroma-Weighted MSE Loss"
+            plot_title = "Chroma-Weighted MSE Experiment — Training & Validation Loss"
+        else:
+            loss_ylabel = "MSE Loss"
+            plot_title = "Baseline — Training & Validation Loss"
         plt.ylabel(loss_ylabel)
         plt.legend()
-        plot_title = "Smooth L1 Experiment — Training & Validation Loss" if args.loss == "smooth_l1" else "Baseline — Training & Validation Loss"
         plt.title(plot_title)
         plt.grid(True, linestyle="--", alpha=0.5)
         plt.savefig(os.path.join(plots_dir, 'training_loss.png'))
