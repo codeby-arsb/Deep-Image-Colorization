@@ -1,0 +1,51 @@
+================================================================================
+STEP 7.2: MSE VS SMOOTH L1 COMPARATIVE ANALYSIS SUMMARY
+================================================================================
+
+1. MSE BEST CHECKPOINT
+   - Path: outputs/checkpoints/best.pth
+   - Best Epoch: 13
+   - Validation Loss: 0.009781
+
+2. SMOOTH L1 BEST CHECKPOINT
+   - Path: outputs/experiments/smooth_l1/checkpoints/best.pth
+   - Best Epoch: 12
+   - Validation Loss: 0.004872
+
+3. EVALUATION METRICS (FIXED 10-IMAGE TEST SET)
+   - Baseline (MSE Epoch 13):
+     * Mean MAE:  0.040320
+     * Mean MSE:  0.004389
+     * Mean PSNR: 24.65 dB
+     * Chroma Retention: 68.4% (10.85 / 15.86)
+
+   - Smooth L1 (Best Epoch 12):
+     * Mean MAE:  0.040560
+     * Mean MSE:  0.004373
+     * Mean PSNR: 24.62 dB
+     * Chroma Retention: 75.3% (11.93 / 15.86)
+
+   - Smooth L1 (Epoch 10 Checkpoint):
+     * Mean MAE:  0.039501
+     * Mean MSE:  0.004560
+     * Mean PSNR: 25.00 dB
+     * Chroma Retention: 73.1% (11.59 / 15.86)
+
+4. PER-IMAGE HEAD-TO-HEAD
+   - Tied (+/- 0.2 dB): 5 / 10 images (50%)
+   - Smooth L1 Wins:    2 / 10 images (20%, max +0.87 dB on vibrant interior)
+   - MSE Wins:          3 / 10 images (30%, max +0.76 dB on neutral interior)
+
+5. DID SMOOTH L1 IMPROVE OVERALL?
+   - Conclusion: NO CLEAR OVERALL IMPROVEMENT.
+   - Justification: While Smooth L1 slightly increased mean chroma retention (+6.9%),
+     aggregate reconstruction metrics on the fixed test set remain essentially tied
+     (PSNR diff: -0.03 dB; MSE diff: -0.000016; MAE diff: +0.000240). Because typical
+     errors in normalized Lab space are < 1.0, beta=1.0 operated mostly within the
+     quadratic regime, yielding behavior very similar to MSE.
+
+6. RECOMMENDED NEXT EXPERIMENT
+   - Introduce a Perceptual / Semantic Loss (e.g., VGG-based feature loss / LPIPS)
+     or a Chroma-Weighted Regression Loss with smaller beta (beta = 0.1) to actively
+     prevent regression-to-the-mean desaturation on foliage and vibrant objects.
+================================================================================

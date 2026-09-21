@@ -39,14 +39,13 @@ venv.bak/
 *.swo
 
 # Project specific
-outputs/
-outputs/checkpoints/*
+outputs/*
 !outputs/checkpoints/.gitkeep
-outputs/predictions/*
 !outputs/predictions/.gitkeep
-outputs/plots/*
 !outputs/plots/.gitkeep
-outputs/evaluation/*.csv
+!outputs/analysis/
+outputs/analysis/*.png
+outputs/analysis/*.csv
 outputs/self_correction/
 models/*
 !models/.gitkeep
