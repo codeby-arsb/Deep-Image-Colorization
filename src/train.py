@@ -9,30 +9,46 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.optim.lr_scheduler import StepLR
 import matplotlib.pyplot as plt
-
-project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.append(os.path.join(project_root, "src"))
-
-import random
 import numpy as np
+import random
+
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+src_dir = os.path.abspath(os.path.dirname(__file__))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+if src_dir not in sys.path:
+    sys.path.insert(0, src_dir)
 
 from model import ColorizationUNet
 from dataset import create_dataloader
 from device import get_device, get_device_name, get_amp_device_type, get_memory_stats
 from evaluate import evaluate_fixed_test_images
-from losses import get_loss_function, get_loss_metadata, DEFAULT_SMOOTH_L1_BETA, DEFAULT_CHROMA_ALPHA
+from losses import (
+    get_loss_function,
+    get_loss_metadata,
+    DEFAULT_SMOOTH_L1_BETA,
+    DEFAULT_CHROMA_ALPHA,
+    DEFAULT_PERCEPTUAL_WEIGHT,
+    DEFAULT_PERCEPTUAL_LAYER,
+    PerceptualColorizationLoss
+)
 
 def get_args():
     parser = argparse.ArgumentParser(description="Train Colorization U-Net")
     parser.add_argument("--epochs", type=int, default=20, help="Number of epochs to train")
     parser.add_argument("--batch-size", type=int, default=8, help="Batch size")
     parser.add_argument("--lr", type=float, default=2e-4, help="Learning rate")
-    parser.add_argument("--loss", type=str, default="mse", choices=["mse", "smooth_l1", "chroma_weighted_mse"],
-                        help="Loss function: 'mse' (Baseline), 'smooth_l1' (Huber), or 'chroma_weighted_mse'")
+    parser.add_argument("--loss", type=str, default="mse",
+                        choices=["mse", "smooth_l1", "chroma_weighted_mse", "perceptual"],
+                        help="Loss function: 'mse' (Baseline), 'smooth_l1' (Huber), 'chroma_weighted_mse', or 'perceptual'")
     parser.add_argument("--loss-beta", type=float, default=DEFAULT_SMOOTH_L1_BETA,
                         help="Beta threshold parameter for Smooth L1 loss (default: 1.0)")
     parser.add_argument("--loss-alpha", type=float, default=DEFAULT_CHROMA_ALPHA,
                         help="Alpha factor for Chroma-Weighted MSE loss (default: 1.0)")
+    parser.add_argument("--perceptual-weight", type=float, default=DEFAULT_PERCEPTUAL_WEIGHT,
+                        help="Weight lambda for perceptual loss (default: 0.01)")
+    parser.add_argument("--perceptual-layer", type=str, default=DEFAULT_PERCEPTUAL_LAYER,
+                        help="VGG-16 layer for perceptual feature loss (default: 'relu2_2')")
     parser.add_argument("--exp-dir", type=str, default=None,
                         help="Custom experiment output directory for checkpoints and metrics")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
@@ -61,8 +77,21 @@ def main():
     use_amp = args.amp and (amp_type is not None)
     
     # Loss, Optimizer, Scheduler
-    criterion = get_loss_function(args.loss, beta=args.loss_beta, alpha=args.loss_alpha)
-    loss_meta = get_loss_metadata(args.loss, beta=args.loss_beta, alpha=args.loss_alpha)
+    criterion = get_loss_function(
+        args.loss,
+        beta=args.loss_beta,
+        alpha=args.loss_alpha,
+        perceptual_weight=args.perceptual_weight,
+        perceptual_layer=args.perceptual_layer
+    ).to(device)
+    
+    loss_meta = get_loss_metadata(
+        args.loss,
+        beta=args.loss_beta,
+        alpha=args.loss_alpha,
+        perceptual_weight=args.perceptual_weight,
+        perceptual_layer=args.perceptual_layer
+    )
     
     # Output paths with strict baseline protection
     if args.exp_dir:
@@ -80,6 +109,13 @@ def main():
         eval_dir = os.path.join(exp_dir, "evaluation")
     elif args.loss == "chroma_weighted_mse":
         exp_sub = "smoke_test_chroma_weighted" if args.smoke_test else os.path.join("experiments", "chroma_weighted")
+        exp_dir = os.path.join(project_root, "outputs", exp_sub)
+        checkpoints_dir = os.path.join(exp_dir, "checkpoints")
+        plots_dir = os.path.join(exp_dir, "plots")
+        history_file = os.path.join(exp_dir, "training_history.csv")
+        eval_dir = os.path.join(exp_dir, "evaluation")
+    elif args.loss == "perceptual":
+        exp_sub = "smoke_test_perceptual" if args.smoke_test else os.path.join("experiments", "perceptual")
         exp_dir = os.path.join(project_root, "outputs", exp_sub)
         checkpoints_dir = os.path.join(exp_dir, "checkpoints")
         plots_dir = os.path.join(exp_dir, "plots")
@@ -108,6 +144,8 @@ def main():
         exp_name = "Experiment 2 — Smooth L1"
     elif args.loss == "chroma_weighted_mse":
         exp_name = "Experiment 3 — Chroma-Weighted MSE"
+    elif args.loss == "perceptual":
+        exp_name = f"Experiment 4 — Perceptual Loss (VGG-16 {args.perceptual_layer}, lambda={args.perceptual_weight})"
     else:
         exp_name = f"Experiment — {args.loss}"
     output_dir = exp_dir if 'exp_dir' in locals() else os.path.dirname(checkpoints_dir)
@@ -132,26 +170,23 @@ def main():
     print(f"Output Directory: {output_dir}")
     print(f"Checkpoints Directory: {checkpoints_dir}")
     print("==================================================\n")
-    
-    # Model
+
     model = ColorizationUNet().to(device)
-    
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
     scheduler = StepLR(optimizer, step_size=10, gamma=0.5)
-    
-    scaler = torch.amp.GradScaler(amp_type) if use_amp else None
-    
+
+    scaler = torch.amp.GradScaler('mps', enabled=use_amp) if device.type == 'mps' else torch.amp.GradScaler('cuda', enabled=use_amp)
+
     start_epoch = 0
     best_val_loss = float('inf')
     best_epoch = 0
     
-    # Resume Checkpoint
-    if args.resume and os.path.isfile(args.resume):
-        print(f"Resuming from checkpoint: {args.resume}")
+    # Checkpoint resumption
+    if args.resume:
+        print(f"Loading checkpoint from: {args.resume}")
         checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
         
-        # Verify loss consistency on resume for scientific fairness
-        chk_loss = checkpoint.get("loss_name", checkpoint.get("config", {}).get("loss", "mse"))
+        chk_loss = checkpoint.get("loss_name", "mse")
         if chk_loss != args.loss:
             raise ValueError(
                 f"[ERROR] Cannot resume experiment with loss '{args.loss}' from a checkpoint trained with loss '{chk_loss}'. "
@@ -193,8 +228,9 @@ def main():
     
     # For smoke test parameter check
     test_param = next(model.parameters())
-    pre_step_param = None
     param_updated = False
+
+    is_perceptual = isinstance(criterion, PerceptualColorizationLoss)
 
     for epoch in range(start_epoch, num_epochs):
         model.train()
@@ -213,10 +249,10 @@ def main():
             if use_amp:
                 with torch.amp.autocast(amp_type):
                     pred_ab = model(l_batch)
-                    loss = criterion(pred_ab, ab_batch)
+                    loss = criterion(pred_ab, ab_batch, l_channel=l_batch) if is_perceptual else criterion(pred_ab, ab_batch)
             else:
                 pred_ab = model(l_batch)
-                loss = criterion(pred_ab, ab_batch)
+                loss = criterion(pred_ab, ab_batch, l_channel=l_batch) if is_perceptual else criterion(pred_ab, ab_batch)
                 
             if torch.isnan(loss) or torch.isinf(loss):
                 print(f"\n[ERROR] Non-finite loss detected at Epoch {epoch+1}, Batch {i+1}: {loss.item()}")
@@ -253,44 +289,36 @@ def main():
                 if use_amp:
                     with torch.amp.autocast(amp_type):
                         pred_ab = model(l_batch)
-                        loss = criterion(pred_ab, ab_batch)
+                        loss = criterion(pred_ab, ab_batch, l_channel=l_batch) if is_perceptual else criterion(pred_ab, ab_batch)
                 else:
                     pred_ab = model(l_batch)
-                    loss = criterion(pred_ab, ab_batch)
+                    loss = criterion(pred_ab, ab_batch, l_channel=l_batch) if is_perceptual else criterion(pred_ab, ab_batch)
                 
                 val_loss_sum += loss.item()
                 
         val_loss = val_loss_sum / num_val_batches
         
         # Scheduler Step
+        current_lr = optimizer.param_groups[0]['lr']
         scheduler.step()
         
         epoch_time = time.time() - epoch_start_time
-        current_lr = scheduler.get_last_lr()[0]
+        mem_stats = get_memory_stats(device)
+        mem_str = f" | Mem: {mem_stats['allocated_mb']:.1f} MB" if "allocated_mb" in mem_stats else ""
         
+        print(f"Epoch [{epoch+1}/{args.epochs}] Time: {epoch_time:.2f}s | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | LR: {current_lr:.6f}{mem_str}")
+        
+        # Save training history
         history['train_loss'].append(train_loss)
         history['val_loss'].append(val_loss)
         
-        mem_stats = get_memory_stats(device)
-        mem_str = ""
-        if "allocated_mb" in mem_stats:
-            mem_str = f" | Mem: {mem_stats['allocated_mb']:.1f} MB"
-            
-        print(f"Epoch [{epoch+1}/{num_epochs}] "
-              f"Time: {epoch_time:.2f}s | "
-              f"Train Loss: {train_loss:.4f} | "
-              f"Val Loss: {val_loss:.4f} | "
-              f"LR: {current_lr:.6f}{mem_str}")
-              
-        # Save History
-        with open(history_file, mode='a', newline='') as f:
+        with open(history_file, mode='a', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
             if write_header:
                 writer.writerow(['epoch', 'train_loss', 'val_loss', 'learning_rate', 'epoch_time'])
                 write_header = False
-            writer.writerow([epoch+1, train_loss, val_loss, current_lr, epoch_time])
-            
-        # Checkpointing
+            writer.writerow([epoch + 1, train_loss, val_loss, current_lr, epoch_time])
+
         checkpoint_state = {
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
@@ -304,6 +332,8 @@ def main():
             'loss_config': loss_meta,
             'loss_beta': args.loss_beta if args.loss == 'smooth_l1' else None,
             'loss_alpha': args.loss_alpha if args.loss == 'chroma_weighted_mse' else None,
+            'perceptual_weight': args.perceptual_weight if args.loss == 'perceptual' else None,
+            'perceptual_layer': args.perceptual_layer if args.loss == 'perceptual' else None,
             'config': vars(args)
         }
         
@@ -371,6 +401,8 @@ def main():
             exp_name = "SMOOTH L1"
         elif args.loss == "chroma_weighted_mse":
             exp_name = "CHROMA-WEIGHTED MSE"
+        elif args.loss == "perceptual":
+            exp_name = "PERCEPTUAL (VGG-16)"
         else:
             exp_name = "BASELINE"
         print("\n==================================================")
@@ -429,6 +461,9 @@ def main():
         elif args.loss == "chroma_weighted_mse":
             loss_ylabel = "Chroma-Weighted MSE Loss"
             plot_title = "Chroma-Weighted MSE Experiment — Training & Validation Loss"
+        elif args.loss == "perceptual":
+            loss_ylabel = "Total Loss (MSE + Perceptual)"
+            plot_title = "Perceptual Loss Experiment — Training & Validation Loss"
         else:
             loss_ylabel = "MSE Loss"
             plot_title = "Baseline — Training & Validation Loss"

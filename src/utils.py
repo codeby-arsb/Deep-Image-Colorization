@@ -1,5 +1,6 @@
 import cv2
 import numpy as np
+import torch
 from skimage.color import rgb2lab, lab2rgb
 
 def load_rgb_image(path: str) -> np.ndarray:
@@ -69,3 +70,55 @@ def reconstruct_rgb(L_normalized: np.ndarray, ab_normalized: np.ndarray) -> np.n
     lab = denormalize_lab(L_normalized, ab_normalized)
     rgb = lab_to_rgb(lab)
     return rgb
+
+def lab_to_rgb_torch(L_norm: torch.Tensor, ab_norm: torch.Tensor) -> torch.Tensor:
+    """Differentiable conversion from normalized Lab tensors to sRGB tensors in [0, 1].
+    
+    Reconstructs RGB images purely using PyTorch tensor operations, preserving autograd
+    gradients back to normalized chrominance predictions without NumPy or PIL conversions.
+    Conforms exactly to CIE 1931 D65 standard illuminant and ITU-R BT.709 sRGB curve used by skimage.
+    
+    Args:
+        L_norm: Normalized luminance tensor [B, 1, H, W] in [-1.0, 1.0].
+        ab_norm: Normalized chrominance tensor [B, 2, H, W] in [-1.0, 1.0].
+        
+    Returns:
+        torch.Tensor: sRGB tensor [B, 3, H, W] in [0.0, 1.0].
+    """
+    # 1. Denormalize to CIE Lab ranges: L in [0, 100], ab in [-128, 128]
+    L = (L_norm + 1.0) * 50.0
+    a = ab_norm[:, 0:1, :, :] * 128.0
+    b = ab_norm[:, 1:2, :, :] * 128.0
+    
+    # 2. Lab to XYZ intermediate representation (D65 white point: [0.95047, 1.0, 1.08883])
+    y = (L + 16.0) / 116.0
+    x = (a / 500.0) + y
+    z = y - (b / 200.0)
+    z = torch.clamp(z, min=0.0)
+    
+    xyz_t = torch.cat([x, y, z], dim=1)
+    mask = xyz_t > 0.2068966
+    xyz = torch.where(mask, torch.pow(xyz_t, 3.0), (xyz_t - 16.0 / 116.0) / 7.787)
+    
+    # Rescale by D65 reference white
+    X = xyz[:, 0:1, :, :] * 0.95047
+    Y = xyz[:, 1:2, :, :] * 1.00000
+    Z = xyz[:, 2:3, :, :] * 1.08883
+    
+    # 3. XYZ to linear sRGB (skimage / ITU-R BT.709 D65 matrix)
+    r =  3.24048134 * X - 1.53715152 * Y - 0.49853633 * Z
+    g = -0.96925495 * X + 1.87599000 * Y + 0.04155593 * Z
+    b_rgb = 0.05564664 * X - 0.20404134 * Y + 1.05731107 * Z
+    
+    rgb_arr = torch.cat([r, g, b_rgb], dim=1)
+    
+    # 4. Linear sRGB to standard non-linear sRGB (gamma correction)
+    mask_gamma = rgb_arr > 0.0031308
+    rgb_gamma = torch.where(
+        mask_gamma,
+        1.055 * torch.pow(torch.clamp(rgb_arr, min=1e-8), 1.0 / 2.4) - 0.055,
+        rgb_arr * 12.92
+    )
+    return torch.clamp(rgb_gamma, 0.0, 1.0)
+
+
