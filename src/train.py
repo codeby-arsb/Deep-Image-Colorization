@@ -146,14 +146,14 @@ def main():
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         start_epoch = checkpoint['epoch'] + 1
         best_val_loss = checkpoint.get('best_val_loss', float('inf'))
-        best_epoch = checkpoint.get('best_epoch', 0)
+        best_epoch = checkpoint.get('best_epoch') or 0
         
         # Check if best.pth has more accurate best_val_loss or best_epoch
         best_chk_path = os.path.join(checkpoints_dir, 'best.pth')
         if os.path.isfile(best_chk_path):
             best_chk = torch.load(best_chk_path, map_location='cpu', weights_only=False)
             best_val_loss = min(best_val_loss, best_chk.get('best_val_loss', float('inf')))
-            if best_epoch == 0:
+            if not best_epoch:
                 best_epoch = best_chk.get('best_epoch', 0)
                 
         print(f"Resumed at epoch {start_epoch + 1} (start_epoch={start_epoch}) with best_val_loss {best_val_loss:.4f} (best_epoch={best_epoch})\n")
@@ -282,6 +282,7 @@ def main():
             'train_loss': train_loss,
             'val_loss': val_loss,
             'best_val_loss': best_val_loss,
+            'best_epoch': best_epoch,
             'loss_name': args.loss,
             'loss_config': loss_meta,
             'loss_beta': args.loss_beta if args.loss == 'smooth_l1' else None,
