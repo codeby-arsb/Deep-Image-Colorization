@@ -62,8 +62,13 @@ class ColorizationInferenceService:
         self.pretrained_model = None
         if PRETRAINED_AVAILABLE:
             try:
-                self.pretrained_model = colorizers.siggraph17(pretrained=True).to(self.device).eval()
-                print("[ColorAI Inference] Pre-trained High-Accuracy CIE Lab U-Net loaded successfully!")
+                cached_pth = os.path.expanduser("~/.cache/torch/hub/checkpoints/siggraph17-df00044c.pth")
+                if os.path.isfile(cached_pth) and os.path.getsize(cached_pth) > 100_000_000:
+                    self.pretrained_model = colorizers.siggraph17(pretrained=True).to(self.device).eval()
+                    print("[ColorAI Inference] Pre-trained High-Accuracy CIE Lab U-Net loaded successfully!")
+                else:
+                    self.pretrained_model = colorizers.siggraph17(pretrained=False).to(self.device).eval()
+                    print("[ColorAI Inference] Pre-trained CIE Lab U-Net initialized (offline mode).")
             except Exception as e:
                 print(f"[ColorAI Inference] Pre-trained loader warning: {e}")
 

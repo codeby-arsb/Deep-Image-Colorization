@@ -1,0 +1,5 @@
+Figure 2: Overall system architecture of the proposed image colorization system
+
+Figure 3: Training loss and model performance analysis during U-Net training
+
+Figure 4: ColorAl application home page for deep image colorization

@@ -47,6 +47,8 @@ outputs/*
 outputs/analysis/*.png
 outputs/analysis/*.csv
 outputs/self_correction/
+!outputs/report_figures/
+!outputs/report_figures/**
 models/*
 !models/.gitkeep
 
